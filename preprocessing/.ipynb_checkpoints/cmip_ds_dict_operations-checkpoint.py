@@ -1,6 +1,8 @@
 import xarray as xr
 import numpy as np
 from collections import defaultdict
+from tqdm.autonotebook import tqdm
+import xesmf as xe
 '''set of functions to generate and manipulate dictionaries of CMIP6 datasets'''
 
 def generate_dict_of_datasets(cat,models_to_exclude,preprocessing_func):
