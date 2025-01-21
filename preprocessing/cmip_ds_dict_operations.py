@@ -44,7 +44,7 @@ def dedrift_datasets_linearly(ds_ddict,pic_ddict,variable_id,min_numYrs_pic):
     attrs_a = ['parent_source_id','grid_label','parent_variant_label']
     attrs_b = ['source_id','grid_label','variant_label']
 
-    for i,ds in tqdm(ssp_ddict.items()):
+    for i,ds in tqdm(ds_ddict.items()):
         #_match_datasets would ideally be used for this, but currently does not take differently named attributes to be matched:
 
         ## adapted from '_match_datasets'
@@ -93,17 +93,19 @@ def create_regridder_dict(dict_of_ddicts, target_grid_ds):
             if len(matching_keys)>0:
                 # take the first one (we don't really care here which one we use)
                 ds = ds_ddict[matching_keys[0]]
-                regridder = xe.Regridder(ds,target_grid_ds,'bilinear',ignore_degenerate=True,periodic=True) #create regridder for this source_id
-                regridders[si] = regridder
+                regridders[si] = xe.Regridder(ds,target_grid_ds,'bilinear',ignore_degenerate=True,periodic=True,unmapped_to_nan=True) #create regridder for this source_id
                 continue
     return regridders
 
 def subtract_ocean_awMean(ds_ddict,variable_id):
     noMean_ddict = defaultdict(dict)
     for k,v in tqdm(ds_ddict.items()):
-        if 'areacello' in v:
-            v[variable_id] = v[variable_id] - v[variable_id].weighted(v.areacello.fillna(0)).mean(['x','y'])
+        if 'areacello' not in v:
+            print('Could not find "areacello" in dataset: '+k)
+            continue
+        else:
             noMean_ddict[k] = v
+            noMean_ddict[k][variable_id] = noMean_ddict[k][variable_id] - noMean_ddict[k][variable_id].weighted(noMean_ddict[k].areacello.fillna(0)).mean(['x','y'],skipna=True)
     return noMean_ddict
     
 def pr_flux_to_m(ddict_in):
