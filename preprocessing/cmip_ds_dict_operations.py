@@ -3,6 +3,11 @@ import numpy as np
 from collections import defaultdict
 from tqdm.autonotebook import tqdm
 import xesmf as xe
+import cftime
+import os
+import gcsfs
+import dask
+fs = gcsfs.GCSFileSystem()
 '''set of functions to generate and manipulate dictionaries of CMIP6 datasets'''
 
 def generate_dict_of_datasets(cat,models_to_exclude,preprocessing_func):
@@ -33,6 +38,116 @@ def _match_twosided_attrs(ds_a, ds_b, attrs_a, attrs_b): #custom version of _mat
     except:
         return 0
 
+def fix_inconsistent_calendars(ds_ddict):
+        for k,ds in ds_ddict.items():
+            try:
+                ds.time[-1] - ds.time[0]
+            except: #unify calendars 
+                not_prolgreg = np.where(np.array([type(i) for i in ds.time.values]) != cftime._cftime.DatetimeProlepticGregorian)[0] #find where calendar is not proleptic gregorian
+                converted_time = ds.isel(time=not_prolgreg).convert_calendar('proleptic_gregorian',use_cftime=True).time #convert at these indices
+                newtime = ds.time.values #replace old time index with new values
+                newtime[not_prolgreg] = converted_time.values
+                ds_ddict[k]['time'] = newtime
+            
+        return ds_ddict
+    
+def find_matching_pic_datasets(ds_ddict,pic_ddict,variable_id,min_numYrs_pic):
+    datasets_without_pic = []
+
+    attrs_a = ['parent_source_id','grid_label','parent_variant_label']
+    attrs_b = ['source_id','grid_label','variant_label']
+
+    for i,ds in tqdm(ds_ddict.items()):
+        ## adapted from '_match_datasets' (which currently does not take differently named attributes to be matched:)
+        matched_datasets = []
+        pic_keys = list(pic_ddict.keys())
+        for k in pic_keys:
+            if _match_twosided_attrs(ds, pic_ddict[k], attrs_a,attrs_b) == len(attrs_a): #
+                if len(np.unique(pic_ddict[k].time.dt.year))>=min_numYrs_pic: #length requirement piControl
+                    if (pic_ddict[k].time[1]-pic_ddict[k].time[0]).dtype != (ds.time[1]-ds.time[0]).dtype: #check if deltatime units are equal between pic and experiment to be dedrifted, otherwise polyval on .time goes wrong? not with units m/month
+                        print('Time units matched piControl dataset different from dataset to be dedrifted, not matching piControl dataset to: '+i)
+                        continue
+                    else:
+                        ds.attrs['matched_pic_ds'] = k
+                    
+        if 'matched_pic_ds' not in ds:
+            datasets_without_pic.append(i)
+    return ds_ddict, datasets_without_pic
+
+def store_matched_pic_linfit(ds_ddict,pic_ddict,variable_id,out_path):
+
+    for k,ds in tqdm(ds_ddict.items()):
+        if 'matched_pic_ds' in ds.attrs:
+            pic_ds = pic_ddict[ds.attrs['matched_pic_ds']]
+
+            fn = '.'.join(ds.attrs['matched_pic_ds'].split('.')[0:8])
+
+            output_fn = os.path.join(out_path,fn) 
+            if fs.exists(output_fn) == False:
+                pic_ds['time'] = np.arange(0,len(pic_ds.time)) #replace time with simple arange, to get trend in m/month (assumption that every month is the same length, which is not entirely true, but ok)
+                pic_fit = pic_ds[variable_id].polyfit(dim='time',deg=1) #linear fit in units m/month
+                pic_fit = pic_fit.chunk({'x':ds[variable_id].chunksizes['x'],'y':ds[variable_id].chunksizes['y']})
+                pic_fit.attrs['slope_units'] = 'm/month'
+                
+                pic_fit.to_zarr(output_fn,mode='w')
+                
+                pic_ds.close()
+                pic_fit.close()
+    return ds_ddict
+
+def subtract_pic_linfit(ds_ddict,variable_id,in_path):
+    dedrifted_ddict = defaultdict(dict)
+    
+    for k,ds in tqdm(ds_ddict.items()):
+        if 'matched_pic_ds' in ds.attrs:
+            fn = '.'.join(ds.attrs['matched_pic_ds'].split('.')[0:8])
+            
+            input_fn = os.path.join(in_path,fn)
+            
+            pic_fit = xr.open_dataset(input_fn,engine='zarr') #load picfit
+
+            #adapted from xmip:
+            chunks = ds[variable_id].isel({di: 0 for di in ds[variable_id].dims if di != 'time'}).chunks
+            trend_time = dask.array.arange(0, len(ds.time), chunks=chunks, dtype=ds[variable_id].dtype)
+    
+            trend_time_da = xr.DataArray(
+                trend_time,
+                dims=['time'],
+            )
+            
+            trend = (pic_fit.polyfit_coefficients.sel(degree=1).isel(member_id=0,drop=True) * trend_time_da)
+            
+            ds[variable_id] = ds[variable_id]-trend
+    
+            
+            dedrifted_ddict[k] = ds
+            pic_fit.close()
+            
+    return dedrifted_ddict
+''' old
+def subtract_pic_linfit(ds_ddict,variable_id,in_path):
+
+    dedrifted_ddict = defaultdict(dict)
+    
+    for k,ds in tqdm(ds_ddict.items()):
+        if 'matched_pic_ds' in ds.attrs:
+            print(k)
+            fn = '.'.join(ds.attrs['matched_pic_ds'].split('.')[0:8])
+            
+            input_fn = os.path.join(in_path,fn)
+            
+            pic_fit = xr.open_dataset(input_fn,engine='zarr') #load picfit
+            
+            ds_drift = xr.polyval(ds.time,pic_fit.sel(degree=1)) #evaluate fit
+            ds_drift = ds_drift - ds_drift.isel(time=0) #remove intercept
+           
+            dedrifted_ddict[k] = ds
+            dedrifted_ddict[k][variable_id] = ds[variable_id] - ds_drift.polyfit_coefficients.isel(member_id=0,drop=True) #drop parent member_id because it may differ from the ds member_id
+            ds_drift.close()
+            pic_fit.close()
+            
+    return dedrifted_ddict
+'''    
 def dedrift_datasets_linearly(ds_ddict,pic_ddict,variable_id,min_numYrs_pic):
     #note: assumed both dataset dicts need to have the same frequency!
     #note: this is different from the default xmip dedrifting because it computes the linear drift over the full piControl length instead of only the part overlapping with the experiment. The reason is that sometimes the piControl simulation is too short to cover all experiments.
@@ -97,6 +212,14 @@ def create_regridder_dict(dict_of_ddicts, target_grid_ds):
                 continue
     return regridders
 
+def regrid_datasets_in_ddict(ds_ddict,regridder_dict):
+    for key,ds in tqdm(ds_ddict.items()):
+        regridder = regridder_dict[ds.attrs['source_id']] #select regridder for this source_id
+        regridded_ds = regridder(ds, keep_attrs=True) #do the regridding
+        
+        ds_ddict[key] = regridded_ds
+    return ds_ddict
+            
 def subtract_ocean_awMean(ds_ddict,variable_id):
     noMean_ddict = defaultdict(dict)
     for k,v in tqdm(ds_ddict.items()):
