@@ -84,6 +84,7 @@ def store_matched_pic_linfit(ds_ddict,pic_ddict,variable_id,out_path):
 
             output_fn = os.path.join(out_path,fn) 
             if fs.exists(output_fn) == False:
+                print(fn)
                 pic_ds['time'] = np.arange(0,len(pic_ds.time)) #replace time with simple arange, to get trend in m/month (assumption that every month is the same length, which is not entirely true, but ok)
                 pic_fit = pic_ds[variable_id].polyfit(dim='time',deg=1) #linear fit in units m/month
                 pic_fit = pic_fit.chunk({'x':ds[variable_id].chunksizes['x'],'y':ds[variable_id].chunksizes['y']})
@@ -105,7 +106,7 @@ def subtract_pic_linfit(ds_ddict,variable_id,in_path):
             input_fn = os.path.join(in_path,fn)
             
             pic_fit = xr.open_dataset(input_fn,engine='zarr') #load picfit
-
+            pic_fit = pic_fit.isel(dcpp_init_year=0,drop=True,missing_dims='ignore')
             #adapted from xmip:
             chunks = ds[variable_id].isel({di: 0 for di in ds[variable_id].dims if di != 'time'}).chunks
             trend_time = dask.array.arange(0, len(ds.time), chunks=chunks, dtype=ds[variable_id].dtype)
