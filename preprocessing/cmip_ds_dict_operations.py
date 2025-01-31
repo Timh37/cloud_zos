@@ -125,77 +125,6 @@ def subtract_pic_linfit(ds_ddict,variable_id,in_path):
             pic_fit.close()
             
     return dedrifted_ddict
-''' old
-def subtract_pic_linfit(ds_ddict,variable_id,in_path):
-
-    dedrifted_ddict = defaultdict(dict)
-    
-    for k,ds in tqdm(ds_ddict.items()):
-        if 'matched_pic_ds' in ds.attrs:
-            print(k)
-            fn = '.'.join(ds.attrs['matched_pic_ds'].split('.')[0:8])
-            
-            input_fn = os.path.join(in_path,fn)
-            
-            pic_fit = xr.open_dataset(input_fn,engine='zarr') #load picfit
-            
-            ds_drift = xr.polyval(ds.time,pic_fit.sel(degree=1)) #evaluate fit
-            ds_drift = ds_drift - ds_drift.isel(time=0) #remove intercept
-           
-            dedrifted_ddict[k] = ds
-            dedrifted_ddict[k][variable_id] = ds[variable_id] - ds_drift.polyfit_coefficients.isel(member_id=0,drop=True) #drop parent member_id because it may differ from the ds member_id
-            ds_drift.close()
-            pic_fit.close()
-            
-    return dedrifted_ddict
-'''    
-def dedrift_datasets_linearly(ds_ddict,pic_ddict,variable_id,min_numYrs_pic):
-    #note: assumed both dataset dicts need to have the same frequency!
-    #note: this is different from the default xmip dedrifting because it computes the linear drift over the full piControl length instead of only the part overlapping with the experiment. The reason is that sometimes the piControl simulation is too short to cover all experiments.
-    ds_ddict_dedrifted = defaultdict(dict)
-    drift_ddict = defaultdict(dict)
-    
-    datasets_without_pic = []
-
-    attrs_a = ['parent_source_id','grid_label','parent_variant_label']
-    attrs_b = ['source_id','grid_label','variant_label']
-
-    for i,ds in tqdm(ds_ddict.items()):
-        #_match_datasets would ideally be used for this, but currently does not take differently named attributes to be matched:
-
-        ## adapted from '_match_datasets'
-        matched_datasets = []
-        pic_keys = list(pic_ddict.keys())
-        for k in pic_keys:
-            if _match_twosided_attrs(ds, pic_ddict[k], attrs_a,attrs_b) == len(attrs_a): #
-                if len(np.unique(pic_ddict[k].time.dt.year))>=min_numYrs_pic: #length requirement piControl
-                    ds_matched = pic_ddict[k]
-                    # preserve the original dictionary key of the chosen dataset in attribute.
-                    ds_matched.attrs["original_key"] = k
-                    matched_datasets.append(ds_matched) #if multiple, we just take the first one for now..
-                    
-        if len(matched_datasets) == 0:
-            datasets_without_pic.append(i)
-            #print('No (long enough) piControl found for: '+i)
-        else: #do the dedrifting
-            pic_ds = matched_datasets[0] #take first matching dataset
-            pic_fit = pic_ds[variable_id].polyfit(dim='time',deg=1) #linear fit
-
-            if (pic_ds.time[1]-pic_ds.time[0]).dtype != (ds.time[1]-ds.time[0]).dtype: #check if deltatime units are equal between pic and experiment to be dedrifted
-                print('Time units piControl dataset different from dataset to be dedrifted, cannot dedrift: '+i)
-                datasets_without_pic.append(i) #if there are more matching datasets, then these could also be checked (but in this workflow this doesn't happen?)
-                continue
-            else:    
-                ds_drift = xr.polyval(ds.time,pic_fit) #evaluate fit
-                ds_drift = ds_drift - ds_drift.isel(time=0) #remove intercept
-
-                drift_ddict[i] = ds_drift
-                
-                ds_ddict_dedrifted[i] = ds
-                ds_ddict_dedrifted[i][variable_id] = ds[variable_id] - ds_drift.polyfit_coefficients.isel(member_id=0,drop=True) #drop parent member_id because it may differ from the ds member_id
-                ds_ddict_dedrifted[i].attrs['dedrifted_with'] = pic_ds.attrs['original_key']
-                
-    return ds_ddict_dedrifted, drift_ddict, datasets_without_pic
 
 # create regridders per source_id (datasets of source_id should be on the same grid after passing through reduce_cat_to_max_num_realizations
 def create_regridder_dict(dict_of_ddicts, target_grid_ds):
@@ -213,6 +142,21 @@ def create_regridder_dict(dict_of_ddicts, target_grid_ds):
                 continue
     return regridders
 
+def create_land_mask_dict(dict_of_ddicts,path_to_masked_data):
+    #get land mask for each model in ddicts
+    model_masks = defaultdict(dict)
+    source_ids = np.unique(np.hstack([[ds.attrs['source_id'] for ds in dataset_dict.values()] for dataset_dict in dict_of_ddicts.values()]))
+    
+    for si in tqdm(source_ids):
+        try:
+            fns = fs.ls(os.path.join(path_to_masked_data,si))
+            masked_ds = xr.open_dataset('gs://'+fns[0],engine='zarr')
+            var = list(masked_ds.keys())[0] #take first variable in masked_ds
+            model_masks[str(si)] = np.isfinite(masked_ds[var].isel(time=0)).isel(member_id=0,drop=True)
+        except:
+            continue
+    return model_masks
+    
 def regrid_datasets_in_ddict(ds_ddict,regridder_dict):
     for key,ds in tqdm(ds_ddict.items()):
         regridder = regridder_dict[ds.attrs['source_id']] #select regridder for this source_id
